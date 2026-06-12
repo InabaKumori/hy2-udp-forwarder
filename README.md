@@ -45,6 +45,35 @@ Change only the host/IP in the node to the forwarder server:
 
 The port remains `44445` unless you configure another listen port.
 
+## Current deployment
+
+Configured on 2026-06-13 for the Oracle forwarder server.
+
+- GitHub project: `https://github.com/InabaKumori/hy2-udp-forwarder`
+- Service: `hy2-udp-forwarder.service`
+- Service state verified: `active` and `enabled`
+- Install directory: `/opt/hy2-udp-forwarder`
+- Config file: `/etc/hy2-udp-forwarder/config.env`
+- Public listener: UDP `0.0.0.0:44445` and UDP `[::]:44445`
+- Upstream endpoint: `108.68.57.148:44445`
+- Inbound/client IPv4 target: `138.2.238.48`
+- Inbound/client IPv6 target: `2603:c024:c01d:ac00:0:c96e:e41f:6daf`
+- Outbound IPv4 observed from the VPS: `104.28.233.73`
+- Outbound IPv6 observed from the VPS: `2603:c024:c01d:ac00:0:c96e:e41f:6daf`
+
+Validation indicators recorded during deployment:
+
+- `systemctl is-active hy2-udp-forwarder` returned `active`.
+- `systemctl is-enabled hy2-udp-forwarder` returned `enabled`.
+- `ss -lunp` showed the Python relay bound to UDP `44445` on both IPv4 and IPv6.
+- A UDP probe sent to `138.2.238.48:44445` created an upstream relay socket to `108.68.57.148:44445`.
+
+For this deployment, clients should keep the original Hysteria2 password, query parameters, and `pinSHA256`, then change only the node host/IP:
+
+- IPv4 host: `138.2.238.48`
+- IPv6 host: `[2603:c024:c01d:ac00:0:c96e:e41f:6daf]`
+- Port: `44445`
+
 ## Service paths
 
 - Service: `hy2-udp-forwarder.service`
