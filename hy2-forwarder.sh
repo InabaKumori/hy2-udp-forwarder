@@ -8,6 +8,7 @@ CONFIG_FILE="$CONFIG_DIR/config.env"
 SERVICE_FILE="/etc/systemd/system/$APP.service"
 DEFAULT_PROTOCOL="hy2"
 DEFAULT_LISTEN_MODE="dual"
+DEFAULT_LISTEN_INTERFACE=""
 DEFAULT_LISTEN_PORT="44445"
 DEFAULT_UPSTREAM_HOST="108.68.57.148"
 DEFAULT_UPSTREAM_PORT="44445"
@@ -21,6 +22,7 @@ need_root() {
     exec sudo env \
       PROTOCOL="${PROTOCOL:-}" \
       LISTEN_MODE="${LISTEN_MODE:-}" \
+      LISTEN_INTERFACE="${LISTEN_INTERFACE:-}" \
       LISTEN_IP="${LISTEN_IP:-}" \
       LISTEN_PORT="${LISTEN_PORT:-}" \
       UPSTREAM_URI="${UPSTREAM_URI:-}" \
@@ -49,6 +51,7 @@ PY
 load_config() {
   PROTOCOL="${PROTOCOL:-$DEFAULT_PROTOCOL}"
   LISTEN_MODE="${LISTEN_MODE:-$DEFAULT_LISTEN_MODE}"
+  LISTEN_INTERFACE="${LISTEN_INTERFACE:-$DEFAULT_LISTEN_INTERFACE}"
   LISTEN_IP="${LISTEN_IP:-}"
   LISTEN_PORT="${LISTEN_PORT:-$DEFAULT_LISTEN_PORT}"
   UPSTREAM_HOST="${UPSTREAM_HOST:-$DEFAULT_UPSTREAM_HOST}"
@@ -70,6 +73,7 @@ write_config() {
   cat > "$CONFIG_FILE" <<EOF_CONFIG
 PROTOCOL="$PROTOCOL"
 LISTEN_MODE="$LISTEN_MODE"
+LISTEN_INTERFACE="$LISTEN_INTERFACE"
 LISTEN_IP="$LISTEN_IP"
 LISTEN_PORT="$LISTEN_PORT"
 UPSTREAM_HOST="$UPSTREAM_HOST"
@@ -83,16 +87,59 @@ install_files() {
   cat > "$INSTALL_DIR/udp_forwarder.py" <<'PY'
 #!/usr/bin/env python3
 import argparse
+import errno
 import selectors
 import socket
 import time
+
+
+BUFFER_SIZE = 65535
+SOCKET_BUFFER_SIZE = 16 * 1024 * 1024
+TRANSIENT_SEND_ERRORS = {errno.EAGAIN, errno.EWOULDBLOCK, errno.ENOBUFS}
 
 
 def log(message):
     print(time.strftime("%Y-%m-%d %H:%M:%S"), message, flush=True)
 
 
-def build_listeners(mode, listen_ip, port):
+def tune_udp_socket(sock):
+    for opt in (socket.SO_RCVBUF, socket.SO_SNDBUF):
+        try:
+            sock.setsockopt(socket.SOL_SOCKET, opt, SOCKET_BUFFER_SIZE)
+        except OSError:
+            pass
+
+
+def bind_to_interface(sock, interface):
+    if not interface:
+        return
+    opt = getattr(socket, "SO_BINDTODEVICE", 25)
+    try:
+        sock.setsockopt(socket.SOL_SOCKET, opt, interface.encode() + b"\0")
+    except OSError as exc:
+        raise SystemExit(f"failed to bind listener to interface {interface}: {exc}")
+
+
+def same_endpoint(left, right):
+    return left[0] == right[0] and left[1] == right[1]
+
+
+def close_session(selector, sessions, upstream_by_fd, session_key, reason=None):
+    session = sessions.pop(session_key, None)
+    if session is None:
+        return
+    upstream = session["upstream"]
+    upstream_by_fd.pop(upstream.fileno(), None)
+    try:
+        selector.unregister(upstream)
+    except Exception:
+        pass
+    upstream.close()
+    if reason:
+        log(f"closed session {session['client']}: {reason}")
+
+
+def build_listeners(mode, listen_ip, listen_interface, port):
     binds = []
     if mode == "dual":
         binds = [(socket.AF_INET, "0.0.0.0"), (socket.AF_INET6, "::")]
@@ -109,6 +156,8 @@ def build_listeners(mode, listen_ip, port):
     sockets = []
     for family, host in binds:
         sock = socket.socket(family, socket.SOCK_DGRAM)
+        tune_udp_socket(sock)
+        bind_to_interface(sock, listen_interface)
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         if family == socket.AF_INET6:
             sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
@@ -123,6 +172,7 @@ def main():
     parser.add_argument("--protocol", default="hy2", choices=["hy2"])
     parser.add_argument("--listen-mode", default="dual", choices=["dual", "ipv4", "ipv6", "custom"])
     parser.add_argument("--listen-ip", default="")
+    parser.add_argument("--listen-interface", default="")
     parser.add_argument("--listen-port", type=int, required=True)
     parser.add_argument("--upstream-host", required=True)
     parser.add_argument("--upstream-port", type=int, required=True)
@@ -135,7 +185,7 @@ def main():
     upstream_family, _, _, _, upstream_addr = upstream_infos[0]
 
     selector = selectors.DefaultSelector()
-    listeners = build_listeners(args.listen_mode, args.listen_ip, args.listen_port)
+    listeners = build_listeners(args.listen_mode, args.listen_ip, args.listen_interface, args.listen_port)
     listener_by_fd = {}
     sessions = {}
     upstream_by_fd = {}
@@ -152,21 +202,28 @@ def main():
             role = key.data
             if role == "listener":
                 try:
-                    data, client_addr = sock.recvfrom(65535)
+                    data, client_addr = sock.recvfrom(BUFFER_SIZE)
                 except BlockingIOError:
+                    continue
+                except OSError as exc:
+                    log(f"listener receive failed on {sock.getsockname()}: {exc}")
                     continue
                 session_key = (sock.fileno(), client_addr)
                 session = sessions.get(session_key)
                 if session is None:
                     upstream = socket.socket(upstream_family, socket.SOCK_DGRAM)
+                    tune_udp_socket(upstream)
                     upstream.setblocking(False)
-                    upstream.connect(upstream_addr)
                     selector.register(upstream, selectors.EVENT_READ, "upstream")
                     session = {"listener": sock, "client": client_addr, "upstream": upstream, "last": now}
                     sessions[session_key] = session
                     upstream_by_fd[upstream.fileno()] = session_key
                 session["last"] = now
-                session["upstream"].send(data)
+                try:
+                    session["upstream"].sendto(data, upstream_addr)
+                except OSError as exc:
+                    if exc.errno not in TRANSIENT_SEND_ERRORS:
+                        close_session(selector, sessions, upstream_by_fd, session_key, f"upstream send failed: {exc}")
             else:
                 session_key = upstream_by_fd.get(sock.fileno())
                 if session_key is None:
@@ -175,22 +232,25 @@ def main():
                 if session is None:
                     continue
                 try:
-                    data = sock.recv(65535)
+                    data, source_addr = sock.recvfrom(BUFFER_SIZE)
                 except BlockingIOError:
                     continue
+                except OSError as exc:
+                    close_session(selector, sessions, upstream_by_fd, session_key, f"upstream receive failed: {exc}")
+                    continue
+                if not same_endpoint(source_addr, upstream_addr):
+                    log(f"ignored packet from unexpected upstream {source_addr}")
+                    continue
                 session["last"] = now
-                session["listener"].sendto(data, session["client"])
+                try:
+                    session["listener"].sendto(data, session["client"])
+                except OSError as exc:
+                    if exc.errno not in TRANSIENT_SEND_ERRORS:
+                        close_session(selector, sessions, upstream_by_fd, session_key, f"client send failed: {exc}")
 
         expired = [k for k, v in sessions.items() if now - v["last"] > args.session_timeout]
         for session_key in expired:
-            session = sessions.pop(session_key)
-            upstream = session["upstream"]
-            upstream_by_fd.pop(upstream.fileno(), None)
-            try:
-                selector.unregister(upstream)
-            except Exception:
-                pass
-            upstream.close()
+            close_session(selector, sessions, upstream_by_fd, session_key)
 
 
 if __name__ == "__main__":
@@ -201,10 +261,12 @@ PY
 #!/usr/bin/env bash
 set -uo pipefail
 . /etc/hy2-udp-forwarder/config.env
+LISTEN_INTERFACE="${LISTEN_INTERFACE:-}"
 exec /usr/bin/python3 /opt/hy2-udp-forwarder/udp_forwarder.py \
   --protocol "$PROTOCOL" \
   --listen-mode "$LISTEN_MODE" \
   --listen-ip "$LISTEN_IP" \
+  --listen-interface "$LISTEN_INTERFACE" \
   --listen-port "$LISTEN_PORT" \
   --upstream-host "$UPSTREAM_HOST" \
   --upstream-port "$UPSTREAM_PORT"
@@ -234,6 +296,19 @@ EOF_SERVICE
   systemctl enable "$APP" >/dev/null
 }
 
+install_performance_tuning() {
+  cat > /etc/sysctl.d/99-hy2-forwarder-performance.conf <<'EOF_SYSCTL'
+net.core.rmem_max = 16777216
+net.core.wmem_max = 16777216
+net.core.rmem_default = 4194304
+net.core.wmem_default = 4194304
+net.core.netdev_max_backlog = 250000
+net.ipv4.udp_rmem_min = 8192
+net.ipv4.udp_wmem_min = 8192
+EOF_SYSCTL
+  sysctl --system >/dev/null 2>&1 || true
+}
+
 open_local_firewall() {
   if command -v ufw >/dev/null 2>&1; then
     ufw allow "$LISTEN_PORT/udp" >/dev/null 2>&1 || true
@@ -249,6 +324,7 @@ install_or_update() {
   write_config
   install_files
   install_service
+  install_performance_tuning
   open_local_firewall
   systemctl restart "$APP"
   say "Installed and started $APP."
@@ -324,7 +400,8 @@ configure_menu() {
     say "3) Set listen port          [$LISTEN_PORT]"
     say "4) Set upstream host        [$UPSTREAM_HOST]"
     say "5) Set upstream port        [$UPSTREAM_PORT]"
-    say "6) Save and restart"
+    say "6) Set listen interface    [$LISTEN_INTERFACE]"
+    say "7) Save and restart"
     say "0) Back"
     read -r -p "Choice: " choice
     case "$choice" in
@@ -333,7 +410,8 @@ configure_menu() {
       3) read -r -p "Listen UDP port: " LISTEN_PORT ;;
       4) read -r -p "Upstream host: " UPSTREAM_HOST ;;
       5) read -r -p "Upstream UDP port: " UPSTREAM_PORT ;;
-      6) write_config; install_or_update; return ;;
+      6) read -r -p "Listen interface, blank for kernel default: " LISTEN_INTERFACE ;;
+      7) write_config; install_or_update; return ;;
       0) return ;;
       *) warn "Invalid choice" ;;
     esac

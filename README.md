@@ -10,6 +10,12 @@ The forwarder is a userspace UDP relay. This matters because it can accept both 
 UPSTREAM_HOST=108.68.57.148 UPSTREAM_PORT=44445 LISTEN_PORT=44445 LISTEN_MODE=dual PROTOCOL=hy2 bash <(curl -fsSL https://raw.githubusercontent.com/InabaKumori/hy2-udp-forwarder/main/hy2-forwarder.sh) --install
 ```
 
+If the server uses a VPN/WARP interface for outbound traffic, pin the public listener to the public NIC so replies to clients do not leave through the VPN interface:
+
+```bash
+UPSTREAM_HOST=108.68.57.148 UPSTREAM_PORT=44445 LISTEN_PORT=44445 LISTEN_MODE=dual LISTEN_INTERFACE=eth0 PROTOCOL=hy2 bash <(curl -fsSL https://raw.githubusercontent.com/InabaKumori/hy2-udp-forwarder/main/hy2-forwarder.sh) --install
+```
+
 Interactive menu:
 
 ```bash
@@ -31,6 +37,7 @@ The configure menu includes:
 - Select protocol: currently `hy2`
 - Select listen IP mode: dual, IPv4 only, IPv6 only, or custom IP
 - Set listen UDP port
+- Set listen interface, optional; use the public NIC such as `eth0` when outbound VPN/WARP routing is enabled
 - Set upstream host
 - Set upstream UDP port
 
@@ -55,6 +62,7 @@ Configured on 2026-06-13 for the Oracle forwarder server.
 - Install directory: `/opt/hy2-udp-forwarder`
 - Config file: `/etc/hy2-udp-forwarder/config.env`
 - Public listener: UDP `0.0.0.0:44445` and UDP `[::]:44445`
+- Listener interface: `eth0`, to keep client-facing replies on the Oracle public NIC while upstream traffic can still use WARP
 - Upstream endpoint: `108.68.57.148:44445`
 - Inbound/client IPv4 target: `138.2.238.48`
 - Inbound/client IPv6 target: `2603:c024:c01d:ac00:0:c96e:e41f:6daf`
@@ -67,6 +75,19 @@ Validation indicators recorded during deployment:
 - `systemctl is-enabled hy2-udp-forwarder` returned `enabled`.
 - `ss -lunp` showed the Python relay bound to UDP `44445` on both IPv4 and IPv6.
 - A UDP probe sent to `138.2.238.48:44445` created an upstream relay socket to `108.68.57.148:44445`.
+- Packet capture after the interface pin showed client replies leaving via `eth0`, while upstream packets still used `wgcf`/WARP.
+
+Performance tuning recorded during testing:
+
+- Relay sockets request 16 MiB receive/send buffers.
+- Installer writes `/etc/sysctl.d/99-hy2-forwarder-performance.conf` with larger UDP/socket buffers and backlog.
+- The relay treats transient UDP send pressure (`EAGAIN`, `EWOULDBLOCK`, `ENOBUFS`) as packet drop instead of closing the client session.
+- Controlled IPv6-client-to-Oracle relay tests exceeded the 50 Mbps target: 60 Mbps target delivered about 58 Mbps upload to the upstream-side receiver and about 52 Mbps download to the client; 80 Mbps target still delivered about 59 Mbps download.
+
+IPv6 cloud ingress requirement:
+
+- The VM host firewall allows IPv6 UDP, but OCI security lists/NSGs must also allow inbound IPv6 UDP `44445` from the intended client source range, for example `::/0` if the node is public.
+- Symptom when the OCI IPv6 UDP ingress rule is missing: IPv6 ping reaches the VM, `ss -lunp` shows `[::]:44445`, but `tcpdump -ni any 'ip6 and udp port 44445'` captures zero client UDP packets.
 
 For this deployment, clients should keep the original Hysteria2 password, query parameters, and `pinSHA256`, then change only the node host/IP:
 
