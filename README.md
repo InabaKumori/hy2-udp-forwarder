@@ -95,6 +95,58 @@ For this deployment, clients should keep the original Hysteria2 password, query 
 - IPv6 host: `[2603:c024:c01d:ac00:0:c96e:e41f:6daf]`
 - Port: `44445`
 
+## Oracle Hysteria2 server deployment
+
+Configured on 2026-06-13 as the router-to-Oracle encrypted Hysteria2 path.
+
+This is separate from the transparent UDP forwarder above. The transparent forwarder keeps the original upstream Hysteria2 session intact, while this service terminates Hysteria2 on the Oracle server so the router-to-Oracle leg is encrypted and congestion-controlled by Hysteria itself.
+
+- Service: `hysteria-oracle-hy2.service`
+- Service state verified: `active` and `enabled`
+- Binary: `/usr/local/bin/hysteria`
+- Config directory: `/etc/hysteria-oracle-hy2`
+- Config file: `/etc/hysteria-oracle-hy2/config.yaml`
+- Public listener: UDP `:44446`
+- Oracle IPv4 endpoint: `138.2.238.48:44446`
+- Oracle IPv6 endpoint: `[2603:c024:c01d:ac00:0:c96e:e41f:6daf]:44446`
+- Server feature enabled for validation: Hysteria built-in `speedTest: true`
+
+Router-side dae changes recorded during deployment:
+
+- Added node label: `oracle_hy2`
+- Forced the main `proxy` group to use `oracle_hy2` only.
+- Disabled the previous active `aws12`, `aws13`, and `aws14` filters in the main `proxy` group without deleting them.
+- Added anti-loop rules so the Hysteria client traffic to Oracle is not captured and re-proxied by dae:
+  - `pname(hysteria) -> must_direct`
+  - `dip(138.2.238.48) -> must_direct`
+  - `dip('2603:c024:c01d:ac00:0:c96e:e41f:6daf') -> must_direct`
+- Router config backups created before replacement:
+  - `/etc/dae/config.dae.sisyphus-backup-20260613-091226`
+  - `/etc/dae/config.dae.sisyphus-backup-force-oracle-20260613-092454`
+
+Validation indicators recorded during deployment:
+
+- Oracle `systemctl is-active hysteria-oracle-hy2.service` returned `active`.
+- Oracle `ss -lunp` showed `hysteria` listening on UDP `44446`.
+- Router `systemctl is-active dae.service` returned `active` after each reload.
+- Router `dae validate -c /etc/dae/config.dae` returned success after each config replacement.
+- Packet capture confirmed router-to-Oracle UDP `44446` reached Oracle directly after the anti-loop rules. IPv4 traffic arrived from the router WAN source, and IPv6 traffic arrived from the router IPv6 source.
+- Hysteria built-in speed tests from the router connected successfully with UDP enabled.
+
+Performance observations:
+
+- Initial 80 Mbps Hysteria target over IPv4 delivered about `49.80 Mbps` download and `48.70 Mbps` upload on a 64 MiB test.
+- Initial 80 Mbps Hysteria target over IPv6 delivered about `48.99 Mbps` download and `47.79 Mbps` upload on a 64 MiB test.
+- A target sweep showed the best observed download slightly above 50 Mbps: `50.22 Mbps` download at an 80 Mbps target, with upload at `49.34 Mbps`.
+- After forcing the main dae `proxy` group to `oracle_hy2`, a post-change 80 Mbps Hysteria test delivered about `46.71 Mbps` download and `47.28 Mbps` upload.
+- Direct router-to-Oracle TCP iperf averaged about `45.6 Mbps` receiver-side during the same session, so the remaining sub-50 Mbps result appears path/capacity-bound rather than caused by the old transparent UDP relay.
+
+Security notes for this mode:
+
+- Do not commit the Hysteria2 auth password, full dae node URI, private key, or certificate fingerprint.
+- The public README may document the endpoint, port, service paths, and sanitized routing rules only.
+- Temporary router-side Hysteria speed-test configs must be stored under `/tmp` and removed after each run.
+
 ## Service paths
 
 - Service: `hy2-udp-forwarder.service`
